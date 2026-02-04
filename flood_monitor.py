@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 Flood Monitoring System for Ping River, Chiang Mai
-Uses Open-Meteo Flood API to forecast river discharge and sends Telegram alerts
+Combines:
+- Open-Meteo Flood API for discharge forecasts
+- ThaiWater API for actual water level measurements
+Sends Telegram alerts with both forecast and real data
 """
 
 import os
@@ -16,7 +19,9 @@ LOCATIONS = [
         "name": "แม่น้ำปิง เชียงใหม่ (สะพานนวรัฐ)",
         "latitude": 18.7374624,
         "longitude": 98.9131759,
-        "station_link": "http://www.thaiwater.net/web/index.php/water/waterstation/46"
+        "station_link": "http://www.thaiwater.net/web/index.php/water/waterstation/46",
+        "station_code": "P.1",  # รหัสสถานี (ต้องตรวจสอบจากทาง ThaiWater)
+        "agency_code": "G07003"  # กรมชลประทาน
     }
 ]
 
@@ -27,17 +32,17 @@ THRESHOLDS = {
     "critical": 600    # วิกฤต
 }
 
+# API Configuration
+# ThaiWater API - ต้องติดต่อ ThaiWater เพื่อขอ API Key และ Base URL
+THAIWATER_API_BASE = os.environ.get("THAIWATER_API_BASE", "https://api.thaiwater.net/v1")
+THAIWATER_API_KEY = os.environ.get("THAIWATER_API_KEY")  # optional, ถ้ามี
+
 # Telegram configuration
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Send summary report even when no alerts (set to True to always get updates)
+# Send summary report even when no alerts
 ALWAYS_SEND_REPORT = True
-
-# Note: TELEGRAM_CHAT_ID can be:
-# - Personal chat: positive number (e.g., "123456789")
-# - Group chat: negative number starting with -100 (e.g., "-1001234567890")
-# - Channel: negative number starting with -100 (e.g., "-1001234567890")
 
 
 def get_flood_forecast(latitude, longitude):
@@ -66,10 +71,116 @@ def get_flood_forecast(latitude, longitude):
         return response.json()
     
     except requests.exceptions.RequestException as e:
-        print(f"❌ Error fetching data from API: {e}")
+        print(f"❌ Error fetching data from Open-Meteo API: {e}")
         return None
     except Exception as e:
         print(f"❌ Unexpected error: {e}")
+        return None
+
+
+def get_thaiwater_data(station_code, agency_code):
+    """
+    Fetch actual water level data from ThaiWater API
+    
+    Args:
+        station_code: Station code (e.g., "P.1")
+        agency_code: Agency code (e.g., "G07003")
+        
+    Returns:
+        dict: Water level data or None if failed
+    """
+    try:
+        # API Endpoint ตามเอกสาร ThaiWater Standard
+        url = f"{THAIWATER_API_BASE}/WaterlevelObservation"
+        
+        # Parameters
+        params = {
+            "latest": "true",
+            "agencyCode": agency_code,
+            "stationCode": station_code
+        }
+        
+        # Headers
+        headers = {
+            "Accept": "application/json"
+        }
+        
+        # Add API Key if available
+        if THAIWATER_API_KEY:
+            headers["Authorization"] = f"Bearer {THAIWATER_API_KEY}"
+        
+        response = requests.get(url, params=params, headers=headers, timeout=30)
+        
+        # Check response
+        if response.status_code == 404:
+            print(f"⚠️ ThaiWater API: Station not found (404)")
+            return None
+        elif response.status_code == 401:
+            print(f"⚠️ ThaiWater API: Unauthorized (401) - API Key may be required")
+            return None
+        
+        response.raise_for_status()
+        
+        data = response.json()
+        print(f"✅ ThaiWater API response received")
+        
+        return data
+    
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️ ThaiWater API error: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"   Status: {e.response.status_code}")
+            print(f"   Response: {e.response.text[:200]}")
+        return None
+    except Exception as e:
+        print(f"❌ Unexpected error accessing ThaiWater API: {e}")
+        return None
+
+
+def parse_thaiwater_data(data):
+    """
+    Parse ThaiWater API response to extract water level info
+    
+    Args:
+        data: ThaiWater API response
+        
+    Returns:
+        dict: Parsed water level information or None
+    """
+    try:
+        if not data:
+            return None
+        
+        # ตามโครงสร้าง API ของ ThaiWater
+        # Structure: metadata + waterlevel array
+        if "waterlevel" not in data:
+            print("⚠️ No waterlevel data in ThaiWater response")
+            return None
+        
+        waterlevels = data.get("waterlevel", [])
+        
+        if not waterlevels:
+            print("⚠️ Empty waterlevel array")
+            return None
+        
+        # Get latest reading (first item)
+        latest = waterlevels[0]
+        
+        result = {
+            "station_code": latest.get("stationMetadata", {}).get("stationCode"),
+            "station_name": latest.get("stationMetadata", {}).get("stationName"),
+            "datetime": latest.get("datetime"),
+            "water_level": latest.get("observation", {}).get("waterlevel"),
+            "discharge": latest.get("observation", {}).get("discharge"),  # ถ้ามี
+            "agency": data.get("metadata", {}).get("dataProviderName", "ThaiWater")
+        }
+        
+        return result
+    
+    except Exception as e:
+        print(f"❌ Error parsing ThaiWater data: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -121,7 +232,7 @@ def analyze_forecast(data, location_name):
         current_level, current_emoji, current_text = get_alert_level(current_discharge)
         
         # Print current status
-        print(f"   💧 Current discharge: {current_discharge:.1f} m³/s - {current_emoji} {current_text}")
+        print(f"   💧 Forecast discharge: {current_discharge:.1f} m³/s - {current_emoji} {current_text}")
         
         # Collect all forecast data
         forecast_data = []
@@ -228,13 +339,14 @@ def send_telegram_message(message, disable_notification=False):
         return False
 
 
-def create_alert_message(location, analysis):
+def create_alert_message(location, analysis, thaiwater_info=None):
     """
     Create formatted alert message for Telegram when alerts are present
     
     Args:
         location: Location information dict
         analysis: Analysis result dict with alert information
+        thaiwater_info: Actual water data from ThaiWater (optional)
         
     Returns:
         str: Formatted message
@@ -246,11 +358,27 @@ def create_alert_message(location, analysis):
         "",
         f"📍 <b>พื้นที่:</b> {location['name']}",
         f"⚠️ <b>ระดับเตือน:</b> {alert['text']}",
-        "",
-        f"💧 <b>ปริมาณน้ำปัจจุบัน:</b> {analysis['current_discharge']:.1f} m³/s {analysis['current_emoji']}",
+        ""
+    ]
+    
+    # Add ThaiWater actual data if available
+    if thaiwater_info:
+        message_lines.extend([
+            "<b>📊 ข้อมูลจริงจาก ThaiWater:</b>",
+            f"  💧 ระดับน้ำ: {thaiwater_info.get('water_level', 'N/A')} ม.(รทก.)",
+        ])
+        if thaiwater_info.get('discharge'):
+            message_lines.append(f"  🌊 ปริมาณน้ำ: {thaiwater_info['discharge']:.1f} m³/s")
+        if thaiwater_info.get('datetime'):
+            message_lines.append(f"  🕐 เวลาตรวจวัด: {thaiwater_info['datetime']}")
+        message_lines.append("")
+    
+    message_lines.extend([
+        f"<b>🔮 พยากรณ์ (Open-Meteo):</b>",
+        f"  💧 ปริมาณน้ำปัจจุบัน: {analysis['current_discharge']:.1f} m³/s {analysis['current_emoji']}",
         "",
         "<b>📊 พยากรณ์ 7 วันข้างหน้า:</b>"
-    ]
+    ])
     
     # Add forecast for next 7 days
     for i, item in enumerate(analysis['forecast_data']):
@@ -279,13 +407,14 @@ def create_alert_message(location, analysis):
     return "\n".join(message_lines)
 
 
-def create_summary_message(location, analysis):
+def create_summary_message(location, analysis, thaiwater_info=None):
     """
     Create formatted summary message for regular monitoring (no alerts)
     
     Args:
         location: Location information dict
         analysis: Analysis result dict
+        thaiwater_info: Actual water data from ThaiWater (optional)
         
     Returns:
         str: Formatted message
@@ -294,11 +423,31 @@ def create_summary_message(location, analysis):
         f"🌊 <b>รายงานสถานการณ์น้ำแม่น้ำปิง</b>",
         "",
         f"📍 <b>พื้นที่:</b> {location['name']}",
-        f"💧 <b>ปริมาณน้ำปัจจุบัน:</b> {analysis['current_discharge']:.1f} m³/s",
-        f"📊 <b>สถานะ:</b> {analysis['current_emoji']} {analysis['current_text']}",
+    ]
+    
+    # Add ThaiWater actual data if available
+    if thaiwater_info:
+        message_lines.extend([
+            "",
+            "<b>📊 ข้อมูลจริงจาก ThaiWater:</b>",
+            f"  💧 ระดับน้ำ: {thaiwater_info.get('water_level', 'N/A')} ม.(รทก.)",
+        ])
+        if thaiwater_info.get('discharge'):
+            discharge = thaiwater_info['discharge']
+            level, emoji, text = get_alert_level(discharge)
+            message_lines.append(f"  🌊 ปริมาณน้ำ: {discharge:.1f} m³/s {emoji}")
+            message_lines.append(f"  📊 สถานะ: {text}")
+        if thaiwater_info.get('datetime'):
+            message_lines.append(f"  🕐 เวลาตรวจวัด: {thaiwater_info['datetime']}")
+    
+    message_lines.extend([
+        "",
+        f"<b>🔮 พยากรณ์ (Open-Meteo):</b>",
+        f"  💧 ปริมาณน้ำปัจจุบัน: {analysis['current_discharge']:.1f} m³/s",
+        f"  📊 สถานะ: {analysis['current_emoji']} {analysis['current_text']}",
         "",
         "<b>📈 พยากรณ์ 7 วันข้างหน้า:</b>"
-    ]
+    ])
     
     # Add forecast for next 7 days
     for i, item in enumerate(analysis['forecast_data']):
@@ -368,11 +517,28 @@ def main():
         print(f"\n📍 Checking: {location['name']}")
         print(f"   Coordinates: {location['latitude']}, {location['longitude']}")
         
+        # Fetch ThaiWater actual data
+        thaiwater_info = None
+        if location.get("station_code") and location.get("agency_code"):
+            print(f"\n🔍 Fetching ThaiWater data...")
+            thaiwater_data = get_thaiwater_data(
+                location["station_code"],
+                location["agency_code"]
+            )
+            
+            if thaiwater_data:
+                thaiwater_info = parse_thaiwater_data(thaiwater_data)
+                if thaiwater_info:
+                    print(f"   📊 ThaiWater: {thaiwater_info.get('water_level', 'N/A')} ม.(รทก.)")
+                    if thaiwater_info.get('discharge'):
+                        print(f"   💧 Discharge: {thaiwater_info['discharge']:.1f} m³/s")
+        
         # Fetch forecast data
+        print(f"\n🔍 Fetching Open-Meteo forecast...")
         data = get_flood_forecast(location["latitude"], location["longitude"])
         
         if data is None:
-            print(f"   ❌ Failed to fetch data")
+            print(f"   ❌ Failed to fetch forecast data")
             any_errors = True
             error_msg = create_error_message(location["name"])
             send_telegram_message(error_msg)
@@ -395,8 +561,8 @@ def main():
             print(f"   💧 Peak discharge: {analysis['highest_alert']['discharge']:.1f} m³/s")
             print(f"   📅 Date: {analysis['highest_alert']['date']}")
             
-            # Send alert message
-            message = create_alert_message(location, analysis)
+            # Send alert message with ThaiWater data
+            message = create_alert_message(location, analysis, thaiwater_info)
             send_telegram_message(message, disable_notification=False)
             any_alerts = True
         else:
@@ -405,7 +571,7 @@ def main():
             # Send summary report if configured
             if ALWAYS_SEND_REPORT:
                 print(f"   📤 Sending summary report...")
-                message = create_summary_message(location, analysis)
+                message = create_summary_message(location, analysis, thaiwater_info)
                 # Use silent notification for normal reports
                 send_telegram_message(message, disable_notification=True)
     
