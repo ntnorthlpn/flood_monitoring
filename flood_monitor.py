@@ -31,6 +31,9 @@ THRESHOLDS = {
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+# Send summary report even when no alerts (set to True to always get updates)
+ALWAYS_SEND_REPORT = True
+
 # Note: TELEGRAM_CHAT_ID can be:
 # - Personal chat: positive number (e.g., "123456789")
 # - Group chat: negative number starting with -100 (e.g., "-1001234567890")
@@ -70,16 +73,36 @@ def get_flood_forecast(latitude, longitude):
         return None
 
 
+def get_alert_level(discharge):
+    """
+    Determine alert level based on discharge value
+    
+    Args:
+        discharge: River discharge in m³/s
+        
+    Returns:
+        tuple: (alert_level, emoji, text)
+    """
+    if discharge >= THRESHOLDS["critical"]:
+        return "critical", "🔴", "วิกฤต (Critical)"
+    elif discharge >= THRESHOLDS["warning"]:
+        return "warning", "🟠", "เตือนภัย (Warning)"
+    elif discharge >= THRESHOLDS["watch"]:
+        return "watch", "🟡", "เฝ้าระวัง (Watch)"
+    else:
+        return "normal", "🟢", "ปกติ (Normal)"
+
+
 def analyze_forecast(data, location_name):
     """
-    Analyze forecast data and check for threshold violations in next 24 hours
+    Analyze forecast data and check for threshold violations
     
     Args:
         data: API response data
         location_name: Name of the monitoring location
         
     Returns:
-        dict: Alert information or None if no alert needed
+        dict: Complete forecast analysis with current status and alerts
     """
     try:
         if not data or "daily" not in data:
@@ -93,54 +116,62 @@ def analyze_forecast(data, location_name):
             print(f"⚠️ No discharge data available for {location_name}")
             return None
         
-        # Check next 24 hours (today and tomorrow)
-        current_time = datetime.now()
-        next_24h = current_time + timedelta(hours=24)
+        # Get current discharge (first value is today)
+        current_discharge = discharges[0] if discharges else 0
+        current_level, current_emoji, current_text = get_alert_level(current_discharge)
         
+        # Print current status
+        print(f"   💧 Current discharge: {current_discharge:.1f} m³/s - {current_emoji} {current_text}")
+        
+        # Collect all forecast data
+        forecast_data = []
         alerts = []
         
-        for i, (time_str, discharge) in enumerate(zip(times[:2], discharges[:2])):
+        for i, (time_str, discharge) in enumerate(zip(times, discharges)):
             forecast_time = datetime.fromisoformat(time_str)
+            level, emoji, text = get_alert_level(discharge)
             
-            if forecast_time > next_24h:
-                continue
+            forecast_item = {
+                "date": time_str,
+                "discharge": discharge,
+                "level": level,
+                "emoji": emoji,
+                "text": text,
+                "time": forecast_time
+            }
+            forecast_data.append(forecast_item)
             
-            # Check thresholds
-            alert_level = None
-            if discharge >= THRESHOLDS["critical"]:
-                alert_level = "critical"
-                alert_emoji = "🔴"
-                alert_text = "วิกฤต (Critical)"
-            elif discharge >= THRESHOLDS["warning"]:
-                alert_level = "warning"
-                alert_emoji = "🟠"
-                alert_text = "เตือนภัย (Warning)"
-            elif discharge >= THRESHOLDS["watch"]:
-                alert_level = "watch"
-                alert_emoji = "🟡"
-                alert_text = "เฝ้าระวัง (Watch)"
-            
-            if alert_level:
-                alerts.append({
-                    "level": alert_level,
-                    "emoji": alert_emoji,
-                    "text": alert_text,
-                    "discharge": discharge,
-                    "time": forecast_time,
-                    "time_str": time_str
-                })
+            # Check for alerts in next 7 days
+            if level != "normal":
+                alerts.append(forecast_item)
+        
+        # Print all forecast data
+        print(f"   📊 7-day forecast:")
+        for item in forecast_data:
+            print(f"      {item['date']}: {item['discharge']:.1f} m³/s {item['emoji']}")
+        
+        result = {
+            "current_discharge": current_discharge,
+            "current_level": current_level,
+            "current_emoji": current_emoji,
+            "current_text": current_text,
+            "forecast_data": forecast_data,
+            "has_alerts": len(alerts) > 0,
+            "alerts": alerts
+        }
         
         if alerts:
             # Return the highest severity alert
-            priority = {"critical": 3, "warning": 2, "watch": 1}
+            priority = {"critical": 3, "warning": 2, "watch": 1, "normal": 0}
             highest_alert = max(alerts, key=lambda x: priority[x["level"]])
-            highest_alert["all_alerts"] = alerts
-            return highest_alert
+            result["highest_alert"] = highest_alert
         
-        return None
+        return result
     
     except Exception as e:
         print(f"❌ Error analyzing forecast: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -170,6 +201,8 @@ def send_telegram_message(message, disable_notification=False):
     """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram credentials not configured")
+        print(f"   TELEGRAM_BOT_TOKEN: {'✓ Set' if TELEGRAM_BOT_TOKEN else '✗ Not set'}")
+        print(f"   TELEGRAM_CHAT_ID: {'✓ Set' if TELEGRAM_CHAT_ID else '✗ Not set'}")
         return False
     
     try:
@@ -190,40 +223,104 @@ def send_telegram_message(message, disable_notification=False):
     
     except requests.exceptions.RequestException as e:
         print(f"❌ Error sending Telegram message: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"   Response: {e.response.text}")
         return False
 
 
-def create_alert_message(location, alert):
+def create_alert_message(location, analysis):
     """
-    Create formatted alert message for Telegram
+    Create formatted alert message for Telegram when alerts are present
     
     Args:
         location: Location information dict
-        alert: Alert information dict
+        analysis: Analysis result dict with alert information
+        
+    Returns:
+        str: Formatted message
+    """
+    alert = analysis["highest_alert"]
+    
+    message_lines = [
+        f"{alert['emoji']} <b>⚠️ แจ้งเตือนระดับน้ำแม่น้ำปิง ⚠️</b> {alert['emoji']}",
+        "",
+        f"📍 <b>พื้นที่:</b> {location['name']}",
+        f"⚠️ <b>ระดับเตือน:</b> {alert['text']}",
+        "",
+        f"💧 <b>ปริมาณน้ำปัจจุบัน:</b> {analysis['current_discharge']:.1f} m³/s {analysis['current_emoji']}",
+        "",
+        "<b>📊 พยากรณ์ 7 วันข้างหน้า:</b>"
+    ]
+    
+    # Add forecast for next 7 days
+    for i, item in enumerate(analysis['forecast_data']):
+        day_label = "วันนี้" if i == 0 else f"วันที่ {i+1}"
+        date_str = format_thai_datetime(item['time'])
+        message_lines.append(
+            f"  {item['emoji']} {day_label} ({date_str}): {item['discharge']:.1f} m³/s"
+        )
+    
+    message_lines.extend([
+        "",
+        "<b>เกณฑ์มาตรฐาน:</b>",
+        f"🟢 ปกติ: &lt; {THRESHOLDS['watch']} m³/s",
+        f"🟡 เฝ้าระวัง: ≥ {THRESHOLDS['watch']} m³/s",
+        f"🟠 เตือนภัย: ≥ {THRESHOLDS['warning']} m³/s",
+        f"🔴 วิกฤต: ≥ {THRESHOLDS['critical']} m³/s",
+        "",
+        "📊 <b>ตรวจสอบข้อมูลทางราชการ:</b>",
+        f"🔗 <a href='{location['station_link']}'>สถานี P.1 สะพานนวรัฐ (ThaiWater)</a>",
+        "",
+        f"🕐 <i>อัปเดต: {datetime.now().strftime('%d/%m/%Y %H:%M')} น.</i>",
+        "",
+        "⚠️ <i>กรุณาติดตามข่าวสารจากหน่วยงานท้องถิ่นและเตรียมความพร้อมรับมือ</i>"
+    ])
+    
+    return "\n".join(message_lines)
+
+
+def create_summary_message(location, analysis):
+    """
+    Create formatted summary message for regular monitoring (no alerts)
+    
+    Args:
+        location: Location information dict
+        analysis: Analysis result dict
         
     Returns:
         str: Formatted message
     """
     message_lines = [
-        f"{alert['emoji']} <b>แจ้งเตือนระดับน้ำแม่น้ำปิง</b> {alert['emoji']}",
+        f"🌊 <b>รายงานสถานการณ์น้ำแม่น้ำปิง</b>",
         "",
         f"📍 <b>พื้นที่:</b> {location['name']}",
-        f"⚠️ <b>ระดับ:</b> {alert['text']}",
-        f"💧 <b>ปริมาณน้ำ:</b> {alert['discharge']:.1f} m³/s",
-        f"📅 <b>วันที่คาดการณ์:</b> {format_thai_datetime(alert['time'])}",
+        f"💧 <b>ปริมาณน้ำปัจจุบัน:</b> {analysis['current_discharge']:.1f} m³/s",
+        f"📊 <b>สถานะ:</b> {analysis['current_emoji']} {analysis['current_text']}",
+        "",
+        "<b>📈 พยากรณ์ 7 วันข้างหน้า:</b>"
+    ]
+    
+    # Add forecast for next 7 days
+    for i, item in enumerate(analysis['forecast_data']):
+        day_label = "วันนี้" if i == 0 else f"วันที่ {i+1}"
+        date_str = format_thai_datetime(item['time'])
+        message_lines.append(
+            f"  {item['emoji']} {day_label} ({date_str}): {item['discharge']:.1f} m³/s"
+        )
+    
+    message_lines.extend([
         "",
         "<b>เกณฑ์มาตรฐาน:</b>",
-        f"🟡 เฝ้าระวัง: > {THRESHOLDS['watch']} m³/s",
-        f"🟠 เตือนภัย: > {THRESHOLDS['warning']} m³/s",
-        f"🔴 วิกฤต: > {THRESHOLDS['critical']} m³/s",
+        f"🟢 ปกติ: &lt; {THRESHOLDS['watch']} m³/s",
+        f"🟡 เฝ้าระวัง: ≥ {THRESHOLDS['watch']} m³/s",
+        f"🟠 เตือนภัย: ≥ {THRESHOLDS['warning']} m³/s",
+        f"🔴 วิกฤต: ≥ {THRESHOLDS['critical']} m³/s",
         "",
-        "📊 <b>ตรวจสอบข้อมูลทางราชการ:</b>",
+        "📊 <b>ข้อมูลเพิ่มเติม:</b>",
         f"🔗 <a href='{location['station_link']}'>สถานี P.1 สะพานนวรัฐ (ThaiWater)</a>",
         "",
-        f"🕐 <i>ข้อมูล ณ {datetime.now().strftime('%d/%m/%Y %H:%M')} น.</i>",
-        "",
-        "⚠️ <i>กรุณาติดตามข่าวสารจากหน่วยงานท้องถิ่นและเตรียมความพร้อมรับมือ</i>"
-    ]
+        f"🕐 <i>อัปเดต: {datetime.now().strftime('%d/%m/%Y %H:%M')} น.</i>"
+    ])
     
     return "\n".join(message_lines)
 
@@ -282,29 +379,47 @@ def main():
             continue
         
         # Analyze forecast
-        alert = analyze_forecast(data, location["name"])
+        analysis = analyze_forecast(data, location["name"])
         
-        if alert:
-            print(f"   ⚠️ ALERT: {alert['text']}")
-            print(f"   💧 Discharge: {alert['discharge']:.1f} m³/s")
-            print(f"   📅 Time: {alert['time_str']}")
+        if analysis is None:
+            print(f"   ❌ Failed to analyze data")
+            any_errors = True
+            error_msg = create_error_message(location["name"], "data")
+            send_telegram_message(error_msg)
+            continue
+        
+        # Send appropriate message
+        if analysis["has_alerts"]:
+            print(f"   ⚠️ ALERT DETECTED!")
+            print(f"   🔴 Highest alert: {analysis['highest_alert']['text']}")
+            print(f"   💧 Peak discharge: {analysis['highest_alert']['discharge']:.1f} m³/s")
+            print(f"   📅 Date: {analysis['highest_alert']['date']}")
             
-            # Send Telegram alert
-            message = create_alert_message(location, alert)
-            send_telegram_message(message)
+            # Send alert message
+            message = create_alert_message(location, analysis)
+            send_telegram_message(message, disable_notification=False)
             any_alerts = True
         else:
             print(f"   ✅ No alerts - levels within normal range")
+            
+            # Send summary report if configured
+            if ALWAYS_SEND_REPORT:
+                print(f"   📤 Sending summary report...")
+                message = create_summary_message(location, analysis)
+                # Use silent notification for normal reports
+                send_telegram_message(message, disable_notification=True)
     
     print("\n" + "=" * 60)
     if any_alerts:
         print("🚨 Alerts were triggered and sent")
-        sys.exit(0)  # Exit successfully even with alerts
+        sys.exit(0)
     elif any_errors:
         print("⚠️ Completed with errors")
-        sys.exit(0)  # Don't fail the workflow, just log the error
+        sys.exit(0)
     else:
         print("✅ Monitoring completed - all clear")
+        if ALWAYS_SEND_REPORT:
+            print("📧 Summary report sent to Telegram")
         sys.exit(0)
 
 
