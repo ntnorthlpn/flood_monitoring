@@ -4,6 +4,7 @@ Flood Monitoring System for Ping River, Chiang Mai
 Combines:
 - Open-Meteo Flood API for discharge forecasts
 - ThaiWater API for actual water level measurements
+- Chiang Mai ThaiWater Website scraping for real-time data
 Sends Telegram alerts with both forecast and real data
 """
 
@@ -12,6 +13,8 @@ import sys
 import requests
 from datetime import datetime, timedelta
 import json
+import re
+from bs4 import BeautifulSoup
 
 # Configuration
 LOCATIONS = [
@@ -20,8 +23,9 @@ LOCATIONS = [
         "latitude": 18.7374624,
         "longitude": 98.9131759,
         "station_link": "http://www.thaiwater.net/web/index.php/water/waterstation/46",
-        "station_code": "P.1",  # รหัสสถานี (ต้องตรวจสอบจากทาง ThaiWater)
-        "agency_code": "G07003"  # กรมชลประทาน
+        "station_code": "P.1",  # รหัสสถานี
+        "agency_code": "G07003",  # กรมชลประทาน
+        "web_station_id": "P.1"  # รหัสสถานีสำหรับเว็บ Chiang Mai ThaiWater
     }
 ]
 
@@ -33,9 +37,12 @@ THRESHOLDS = {
 }
 
 # API Configuration
-# ThaiWater API - ต้องติดต่อ ThaiWater เพื่อขอ API Key และ Base URL
+# ThaiWater API
 THAIWATER_API_BASE = os.environ.get("THAIWATER_API_BASE", "https://api.thaiwater.net/v1")
-THAIWATER_API_KEY = os.environ.get("THAIWATER_API_KEY")  # optional, ถ้ามี
+THAIWATER_API_KEY = os.environ.get("THAIWATER_API_KEY")
+
+# Chiang Mai ThaiWater Website
+CHIANGMAI_THAIWATER_URL = "https://chiangmai.thaiwater.net/wl"
 
 # Telegram configuration
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -43,6 +50,111 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 # Send summary report even when no alerts
 ALWAYS_SEND_REPORT = True
+
+
+def get_chiangmai_thaiwater_data(station_id=None):
+    """
+    Scrape water level data from Chiang Mai ThaiWater website
+    
+    Args:
+        station_id: Optional station ID to filter (e.g., "P.1")
+        
+    Returns:
+        list: List of station data dictionaries or None if failed
+    """
+    try:
+        print(f"   🌐 Fetching data from {CHIANGMAI_THAIWATER_URL}...")
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        response = requests.get(CHIANGMAI_THAIWATER_URL, headers=headers, timeout=30)
+        response.raise_for_status()
+        
+        # Parse HTML
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Find the data - structure varies, try multiple approaches
+        stations_data = []
+        
+        # Try to find tables with water level data
+        tables = soup.find_all('table')
+        
+        for table in tables:
+            rows = table.find_all('tr')
+            
+            for row in rows:
+                cells = row.find_all(['td', 'th'])
+                
+                if len(cells) >= 3:  # Assuming at least station, level, and time columns
+                    # Extract text from cells
+                    cell_texts = [cell.get_text(strip=True) for cell in cells]
+                    
+                    # Look for station codes like P.1, P.2, etc.
+                    station_match = None
+                    for text in cell_texts:
+                        if re.match(r'^P\.\d+', text):
+                            station_match = text
+                            break
+                    
+                    if station_match:
+                        # Try to extract water level (look for numbers with optional decimal)
+                        water_level = None
+                        for text in cell_texts:
+                            # Match number with optional decimal
+                            level_match = re.search(r'(\d+\.?\d*)', text)
+                            if level_match:
+                                try:
+                                    water_level = float(level_match.group(1))
+                                    break
+                                except ValueError:
+                                    continue
+                        
+                        if water_level is not None:
+                            station_info = {
+                                'station_code': station_match,
+                                'water_level': water_level,
+                                'raw_data': cell_texts,
+                                'datetime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                'source': 'Chiang Mai ThaiWater Website'
+                            }
+                            
+                            # If specific station requested, only add that one
+                            if station_id is None or station_match == station_id:
+                                stations_data.append(station_info)
+        
+        # Try alternative: look for JSON data in script tags
+        if not stations_data:
+            scripts = soup.find_all('script')
+            for script in scripts:
+                if script.string:
+                    # Look for JSON-like data
+                    json_match = re.search(r'var\s+\w+\s*=\s*(\[.*?\]|\{.*?\});', script.string, re.DOTALL)
+                    if json_match:
+                        try:
+                            data = json.loads(json_match.group(1))
+                            print(f"   📊 Found JSON data in script tag")
+                            # Process JSON data based on structure
+                            # This will need adjustment based on actual data structure
+                        except json.JSONDecodeError:
+                            continue
+        
+        if stations_data:
+            print(f"   ✅ Found {len(stations_data)} station(s) data from website")
+            return stations_data
+        else:
+            print(f"   ⚠️ No station data found on website")
+            return None
+    
+    except requests.exceptions.RequestException as e:
+        print(f"   ❌ Error fetching from Chiang Mai ThaiWater website: {e}")
+        return None
+    except Exception as e:
+        print(f"   ❌ Error parsing website data: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def get_flood_forecast(latitude, longitude):
@@ -152,7 +264,6 @@ def parse_thaiwater_data(data):
             return None
         
         # ตามโครงสร้าง API ของ ThaiWater
-        # Structure: metadata + waterlevel array
         if "waterlevel" not in data:
             print("⚠️ No waterlevel data in ThaiWater response")
             return None
@@ -171,7 +282,7 @@ def parse_thaiwater_data(data):
             "station_name": latest.get("stationMetadata", {}).get("stationName"),
             "datetime": latest.get("datetime"),
             "water_level": latest.get("observation", {}).get("waterlevel"),
-            "discharge": latest.get("observation", {}).get("discharge"),  # ถ้ามี
+            "discharge": latest.get("observation", {}).get("discharge"),
             "agency": data.get("metadata", {}).get("dataProviderName", "ThaiWater")
         }
         
@@ -339,14 +450,15 @@ def send_telegram_message(message, disable_notification=False):
         return False
 
 
-def create_alert_message(location, analysis, thaiwater_info=None):
+def create_alert_message(location, analysis, thaiwater_info=None, website_info=None):
     """
     Create formatted alert message for Telegram when alerts are present
     
     Args:
         location: Location information dict
         analysis: Analysis result dict with alert information
-        thaiwater_info: Actual water data from ThaiWater (optional)
+        thaiwater_info: Actual water data from ThaiWater API (optional)
+        website_info: Actual water data from website scraping (optional)
         
     Returns:
         str: Formatted message
@@ -361,10 +473,20 @@ def create_alert_message(location, analysis, thaiwater_info=None):
         ""
     ]
     
-    # Add ThaiWater actual data if available
+    # Add website data if available (prioritize as it's most recent)
+    if website_info:
+        message_lines.extend([
+            "<b>🌐 ข้อมูลเรียลไทม์จากเว็บไซต์:</b>",
+            f"  💧 ระดับน้ำ: {website_info.get('water_level', 'N/A')} ม.(รทก.)",
+            f"  🕐 อัปเดตล่าสุด: {website_info.get('datetime', 'N/A')}",
+            f"  📡 แหล่งข้อมูล: {website_info.get('source', 'Chiang Mai ThaiWater')}",
+            ""
+        ])
+    
+    # Add ThaiWater API data if available
     if thaiwater_info:
         message_lines.extend([
-            "<b>📊 ข้อมูลจริงจาก ThaiWater:</b>",
+            "<b>📊 ข้อมูลจาก ThaiWater API:</b>",
             f"  💧 ระดับน้ำ: {thaiwater_info.get('water_level', 'N/A')} ม.(รทก.)",
         ])
         if thaiwater_info.get('discharge'):
@@ -398,6 +520,7 @@ def create_alert_message(location, analysis, thaiwater_info=None):
         "",
         "📊 <b>ตรวจสอบข้อมูลทางราชการ:</b>",
         f"🔗 <a href='{location['station_link']}'>สถานี P.1 สะพานนวรัฐ (ThaiWater)</a>",
+        f"🔗 <a href='{CHIANGMAI_THAIWATER_URL}'>ศูนย์ข้อมูลน้ำ จ.เชียงใหม่</a>",
         "",
         f"🕐 <i>อัปเดต: {datetime.now().strftime('%d/%m/%Y %H:%M')} น.</i>",
         "",
@@ -407,14 +530,15 @@ def create_alert_message(location, analysis, thaiwater_info=None):
     return "\n".join(message_lines)
 
 
-def create_summary_message(location, analysis, thaiwater_info=None):
+def create_summary_message(location, analysis, thaiwater_info=None, website_info=None):
     """
     Create formatted summary message for regular monitoring (no alerts)
     
     Args:
         location: Location information dict
         analysis: Analysis result dict
-        thaiwater_info: Actual water data from ThaiWater (optional)
+        thaiwater_info: Actual water data from ThaiWater API (optional)
+        website_info: Actual water data from website scraping (optional)
         
     Returns:
         str: Formatted message
@@ -425,11 +549,20 @@ def create_summary_message(location, analysis, thaiwater_info=None):
         f"📍 <b>พื้นที่:</b> {location['name']}",
     ]
     
-    # Add ThaiWater actual data if available
+    # Add website data if available (prioritize as it's most recent)
+    if website_info:
+        message_lines.extend([
+            "",
+            "<b>🌐 ข้อมูลเรียลไทม์จากเว็บไซต์:</b>",
+            f"  💧 ระดับน้ำ: {website_info.get('water_level', 'N/A')} ม.(รทก.)",
+            f"  🕐 อัปเดตล่าสุด: {website_info.get('datetime', 'N/A')}",
+        ])
+    
+    # Add ThaiWater API data if available
     if thaiwater_info:
         message_lines.extend([
             "",
-            "<b>📊 ข้อมูลจริงจาก ThaiWater:</b>",
+            "<b>📊 ข้อมูลจาก ThaiWater API:</b>",
             f"  💧 ระดับน้ำ: {thaiwater_info.get('water_level', 'N/A')} ม.(รทก.)",
         ])
         if thaiwater_info.get('discharge'):
@@ -467,6 +600,7 @@ def create_summary_message(location, analysis, thaiwater_info=None):
         "",
         "📊 <b>ข้อมูลเพิ่มเติม:</b>",
         f"🔗 <a href='{location['station_link']}'>สถานี P.1 สะพานนวรัฐ (ThaiWater)</a>",
+        f"🔗 <a href='{CHIANGMAI_THAIWATER_URL}'>ศูนย์ข้อมูลน้ำ จ.เชียงใหม่</a>",
         "",
         f"🕐 <i>อัปเดต: {datetime.now().strftime('%d/%m/%Y %H:%M')} น.</i>"
     ])
@@ -517,10 +651,21 @@ def main():
         print(f"\n📍 Checking: {location['name']}")
         print(f"   Coordinates: {location['latitude']}, {location['longitude']}")
         
-        # Fetch ThaiWater actual data
+        # 1. Fetch data from Chiang Mai ThaiWater Website (most recent)
+        website_info = None
+        if location.get("web_station_id"):
+            print(f"\n🌐 Fetching data from Chiang Mai ThaiWater website...")
+            website_data = get_chiangmai_thaiwater_data(location["web_station_id"])
+            
+            if website_data and len(website_data) > 0:
+                website_info = website_data[0]  # Get first matching station
+                print(f"   📊 Website: {website_info.get('water_level', 'N/A')} ม.(รทก.)")
+                print(f"   🕐 Time: {website_info.get('datetime', 'N/A')}")
+        
+        # 2. Fetch ThaiWater API data (as backup/comparison)
         thaiwater_info = None
         if location.get("station_code") and location.get("agency_code"):
-            print(f"\n🔍 Fetching ThaiWater data...")
+            print(f"\n🔍 Fetching ThaiWater API data...")
             thaiwater_data = get_thaiwater_data(
                 location["station_code"],
                 location["agency_code"]
@@ -529,11 +674,11 @@ def main():
             if thaiwater_data:
                 thaiwater_info = parse_thaiwater_data(thaiwater_data)
                 if thaiwater_info:
-                    print(f"   📊 ThaiWater: {thaiwater_info.get('water_level', 'N/A')} ม.(รทก.)")
+                    print(f"   📊 ThaiWater API: {thaiwater_info.get('water_level', 'N/A')} ม.(รทก.)")
                     if thaiwater_info.get('discharge'):
                         print(f"   💧 Discharge: {thaiwater_info['discharge']:.1f} m³/s")
         
-        # Fetch forecast data
+        # 3. Fetch forecast data from Open-Meteo
         print(f"\n🔍 Fetching Open-Meteo forecast...")
         data = get_flood_forecast(location["latitude"], location["longitude"])
         
@@ -561,8 +706,8 @@ def main():
             print(f"   💧 Peak discharge: {analysis['highest_alert']['discharge']:.1f} m³/s")
             print(f"   📅 Date: {analysis['highest_alert']['date']}")
             
-            # Send alert message with ThaiWater data
-            message = create_alert_message(location, analysis, thaiwater_info)
+            # Send alert message with all available data
+            message = create_alert_message(location, analysis, thaiwater_info, website_info)
             send_telegram_message(message, disable_notification=False)
             any_alerts = True
         else:
@@ -571,7 +716,7 @@ def main():
             # Send summary report if configured
             if ALWAYS_SEND_REPORT:
                 print(f"   📤 Sending summary report...")
-                message = create_summary_message(location, analysis, thaiwater_info)
+                message = create_summary_message(location, analysis, thaiwater_info, website_info)
                 # Use silent notification for normal reports
                 send_telegram_message(message, disable_notification=True)
     
