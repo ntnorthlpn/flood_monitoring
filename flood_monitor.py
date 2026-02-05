@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Flood Monitoring System for Ping River, Chiang Mai
+Flood Monitoring System for Ping River, Chiang Mai - IMPROVED VERSION
 Combines:
 - Open-Meteo Flood API for discharge forecasts
 - ThaiWater API for actual water level measurements
-- Chiang Mai ThaiWater Website scraping for real-time data
+- Chiang Mai ThaiWater Website API for real-time data
 Sends Telegram alerts with both forecast and real data
 """
 
@@ -25,7 +25,8 @@ LOCATIONS = [
         "station_link": "http://www.thaiwater.net/web/index.php/water/waterstation/46",
         "station_code": "P.1",  # รหัสสถานี
         "agency_code": "G07003",  # กรมชลประทาน
-        "web_station_id": "P.1"  # รหัสสถานีสำหรับเว็บ Chiang Mai ThaiWater
+        "web_station_id": "P.1",  # รหัสสถานีสำหรับเว็บ Chiang Mai ThaiWater
+        "province_code": "50"  # รหัสจังหวัดเชียงใหม่
     }
 ]
 
@@ -41,8 +42,13 @@ THRESHOLDS = {
 THAIWATER_API_BASE = os.environ.get("THAIWATER_API_BASE", "https://api.thaiwater.net/v1")
 THAIWATER_API_KEY = os.environ.get("THAIWATER_API_KEY")
 
-# Chiang Mai ThaiWater Website
+# Chiang Mai ThaiWater Website - Multiple possible endpoints
 CHIANGMAI_THAIWATER_URL = "https://chiangmai.thaiwater.net/wl"
+CHIANGMAI_THAIWATER_API_ENDPOINTS = [
+    "https://chiangmai.thaiwater.net/api/waterlevel",
+    "https://chiangmai.thaiwater.net/api/getTCFloodData",
+    "https://chiangmai.thaiwater.net/data/waterlevel",
+]
 
 # Telegram configuration
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -52,106 +58,260 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ALWAYS_SEND_REPORT = True
 
 
-def get_chiangmai_thaiwater_data(station_id=None):
+def get_chiangmai_thaiwater_api(province_code=None, measure_datetime=None):
     """
-    Scrape water level data from Chiang Mai ThaiWater website
+    Try to fetch data from Chiang Mai ThaiWater API endpoints
+    
+    Args:
+        province_code: Province code (e.g., "50" for Chiang Mai)
+        measure_datetime: Optional datetime filter (YYYY-MM-DD format)
+        
+    Returns:
+        dict: API response data or None if failed
+    """
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json',
+            'Referer': 'https://chiangmai.thaiwater.net/wl'
+        }
+        
+        # Try getTCFloodData endpoint first (most likely to have real-time data)
+        if not measure_datetime:
+            measure_datetime = datetime.now().strftime('%Y-%m-%d')
+        
+        endpoints_to_try = [
+            f"https://chiangmai.thaiwater.net/api/getTCFloodData?measure_datetime={measure_datetime}",
+            f"https://chiangmai.thaiwater.net/api/getTCFloodData",
+            "https://chiangmai.thaiwater.net/api/waterlevel",
+            f"https://chiangmai.thaiwater.net/api/waterlevel?province_code={province_code}" if province_code else None,
+        ]
+        
+        for endpoint in endpoints_to_try:
+            if endpoint is None:
+                continue
+                
+            try:
+                print(f"   🔍 Trying endpoint: {endpoint}")
+                response = requests.get(endpoint, headers=headers, timeout=30)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    print(f"   ✅ Success! Got data from {endpoint}")
+                    return data
+                else:
+                    print(f"   ⚠️ Status {response.status_code}")
+                    
+            except Exception as e:
+                print(f"   ❌ Failed: {e}")
+                continue
+        
+        return None
+    
+    except Exception as e:
+        print(f"   ❌ Error in API fetch: {e}")
+        return None
+
+
+def parse_chiangmai_api_data(data, station_id=None):
+    """
+    Parse data from Chiang Mai ThaiWater API
+    
+    Args:
+        data: API response data
+        station_id: Optional station ID to filter (e.g., "P.1")
+        
+    Returns:
+        list: List of parsed station data or None
+    """
+    try:
+        if not data:
+            return None
+        
+        stations = []
+        
+        # Handle different possible data structures
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            # Try common keys
+            items = data.get('data', data.get('stations', data.get('waterlevel', [data])))
+        else:
+            return None
+        
+        for item in items:
+            # Extract station info - handle various field names
+            station_code = (item.get('station_code') or 
+                          item.get('stationCode') or 
+                          item.get('station_id') or 
+                          item.get('id'))
+            
+            # Skip if not matching requested station
+            if station_id and station_code != station_id:
+                continue
+            
+            # Extract water level - try different field names
+            water_level = (item.get('water_level') or 
+                         item.get('waterlevel') or 
+                         item.get('wl') or 
+                         item.get('value'))
+            
+            # Extract other useful fields
+            station_name = (item.get('station_name') or 
+                          item.get('stationName') or 
+                          item.get('name'))
+            
+            datetime_str = (item.get('datetime') or 
+                          item.get('measure_datetime') or 
+                          item.get('timestamp') or 
+                          item.get('date'))
+            
+            if water_level is not None:
+                try:
+                    water_level = float(water_level)
+                except (ValueError, TypeError):
+                    continue
+                
+                station_info = {
+                    'station_code': station_code,
+                    'station_name': station_name,
+                    'water_level': water_level,
+                    'datetime': datetime_str or datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'source': 'Chiang Mai ThaiWater API',
+                    'raw_data': item
+                }
+                
+                stations.append(station_info)
+        
+        return stations if stations else None
+    
+    except Exception as e:
+        print(f"   ❌ Error parsing API data: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def get_chiangmai_thaiwater_data(station_id=None, province_code=None):
+    """
+    Get water level data from Chiang Mai ThaiWater website
+    Tries both API endpoints and HTML scraping
     
     Args:
         station_id: Optional station ID to filter (e.g., "P.1")
+        province_code: Province code for API calls (e.g., "50")
         
     Returns:
         list: List of station data dictionaries or None if failed
     """
+    print(f"   🌐 Fetching from Chiang Mai ThaiWater...")
+    
+    # Method 1: Try API endpoints first
+    print(f"   📡 Attempting API fetch...")
+    api_data = get_chiangmai_thaiwater_api(province_code)
+    
+    if api_data:
+        parsed = parse_chiangmai_api_data(api_data, station_id)
+        if parsed:
+            print(f"   ✅ Found {len(parsed)} station(s) from API")
+            return parsed
+    
+    # Method 2: Fall back to HTML scraping
+    print(f"   📄 Falling back to HTML scraping...")
     try:
-        print(f"   🌐 Fetching data from {CHIANGMAI_THAIWATER_URL}...")
-        
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         
         response = requests.get(CHIANGMAI_THAIWATER_URL, headers=headers, timeout=30)
         response.raise_for_status()
         
-        # Parse HTML
         soup = BeautifulSoup(response.content, 'html.parser')
-        
-        # Find the data - structure varies, try multiple approaches
         stations_data = []
         
-        # Try to find tables with water level data
-        tables = soup.find_all('table')
+        # Look for JSON data in script tags
+        scripts = soup.find_all('script')
+        for script in scripts:
+            if not script.string:
+                continue
+            
+            # Try to find JSON arrays or objects
+            json_patterns = [
+                r'var\s+\w+\s*=\s*(\[.*?\]);',
+                r'var\s+\w+\s*=\s*(\{.*?\});',
+                r'data\s*:\s*(\[.*?\])',
+                r'stations\s*:\s*(\[.*?\])',
+            ]
+            
+            for pattern in json_patterns:
+                matches = re.findall(pattern, script.string, re.DOTALL)
+                for match in matches:
+                    try:
+                        data = json.loads(match)
+                        parsed = parse_chiangmai_api_data(data, station_id)
+                        if parsed:
+                            stations_data.extend(parsed)
+                    except:
+                        continue
         
+        # Also try table scraping
+        tables = soup.find_all('table')
         for table in tables:
             rows = table.find_all('tr')
             
             for row in rows:
                 cells = row.find_all(['td', 'th'])
+                if len(cells) < 3:
+                    continue
                 
-                if len(cells) >= 3:  # Assuming at least station, level, and time columns
-                    # Extract text from cells
-                    cell_texts = [cell.get_text(strip=True) for cell in cells]
-                    
-                    # Look for station codes like P.1, P.2, etc.
-                    station_match = None
-                    for text in cell_texts:
-                        if re.match(r'^P\.\d+', text):
-                            station_match = text
-                            break
-                    
-                    if station_match:
-                        # Try to extract water level (look for numbers with optional decimal)
-                        water_level = None
-                        for text in cell_texts:
-                            # Match number with optional decimal
-                            level_match = re.search(r'(\d+\.?\d*)', text)
-                            if level_match:
-                                try:
-                                    water_level = float(level_match.group(1))
-                                    break
-                                except ValueError:
-                                    continue
-                        
-                        if water_level is not None:
-                            station_info = {
-                                'station_code': station_match,
-                                'water_level': water_level,
-                                'raw_data': cell_texts,
-                                'datetime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                                'source': 'Chiang Mai ThaiWater Website'
-                            }
-                            
-                            # If specific station requested, only add that one
-                            if station_id is None or station_match == station_id:
-                                stations_data.append(station_info)
-        
-        # Try alternative: look for JSON data in script tags
-        if not stations_data:
-            scripts = soup.find_all('script')
-            for script in scripts:
-                if script.string:
-                    # Look for JSON-like data
-                    json_match = re.search(r'var\s+\w+\s*=\s*(\[.*?\]|\{.*?\});', script.string, re.DOTALL)
-                    if json_match:
+                cell_texts = [cell.get_text(strip=True) for cell in cells]
+                
+                # Look for station codes
+                station_match = None
+                for text in cell_texts:
+                    if re.match(r'^P\.\d+', text):
+                        station_match = text
+                        break
+                
+                if not station_match:
+                    continue
+                
+                # Skip if not matching requested station
+                if station_id and station_match != station_id:
+                    continue
+                
+                # Extract water level
+                water_level = None
+                for text in cell_texts:
+                    level_match = re.search(r'(\d+\.?\d*)', text)
+                    if level_match:
                         try:
-                            data = json.loads(json_match.group(1))
-                            print(f"   📊 Found JSON data in script tag")
-                            # Process JSON data based on structure
-                            # This will need adjustment based on actual data structure
-                        except json.JSONDecodeError:
+                            water_level = float(level_match.group(1))
+                            # Sanity check: water level should be reasonable
+                            if 0 < water_level < 1000:
+                                break
+                        except ValueError:
                             continue
+                
+                if water_level is not None:
+                    station_info = {
+                        'station_code': station_match,
+                        'water_level': water_level,
+                        'raw_data': cell_texts,
+                        'datetime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'source': 'Chiang Mai ThaiWater Website (Table)'
+                    }
+                    stations_data.append(station_info)
         
         if stations_data:
-            print(f"   ✅ Found {len(stations_data)} station(s) data from website")
+            print(f"   ✅ Found {len(stations_data)} station(s) from HTML")
             return stations_data
         else:
-            print(f"   ⚠️ No station data found on website")
+            print(f"   ⚠️ No data found in HTML")
             return None
     
-    except requests.exceptions.RequestException as e:
-        print(f"   ❌ Error fetching from Chiang Mai ThaiWater website: {e}")
-        return None
     except Exception as e:
-        print(f"   ❌ Error parsing website data: {e}")
+        print(f"   ❌ Error in HTML scraping: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -202,28 +362,23 @@ def get_thaiwater_data(station_code, agency_code):
         dict: Water level data or None if failed
     """
     try:
-        # API Endpoint ตามเอกสาร ThaiWater Standard
         url = f"{THAIWATER_API_BASE}/WaterlevelObservation"
         
-        # Parameters
         params = {
             "latest": "true",
             "agencyCode": agency_code,
             "stationCode": station_code
         }
         
-        # Headers
         headers = {
             "Accept": "application/json"
         }
         
-        # Add API Key if available
         if THAIWATER_API_KEY:
             headers["Authorization"] = f"Bearer {THAIWATER_API_KEY}"
         
         response = requests.get(url, params=params, headers=headers, timeout=30)
         
-        # Check response
         if response.status_code == 404:
             print(f"⚠️ ThaiWater API: Station not found (404)")
             return None
@@ -232,7 +387,6 @@ def get_thaiwater_data(station_code, agency_code):
             return None
         
         response.raise_for_status()
-        
         data = response.json()
         print(f"✅ ThaiWater API response received")
         
@@ -263,7 +417,6 @@ def parse_thaiwater_data(data):
         if not data:
             return None
         
-        # ตามโครงสร้าง API ของ ThaiWater
         if "waterlevel" not in data:
             print("⚠️ No waterlevel data in ThaiWater response")
             return None
@@ -274,7 +427,6 @@ def parse_thaiwater_data(data):
             print("⚠️ Empty waterlevel array")
             return None
         
-        # Get latest reading (first item)
         latest = waterlevels[0]
         
         result = {
@@ -338,14 +490,11 @@ def analyze_forecast(data, location_name):
             print(f"⚠️ No discharge data available for {location_name}")
             return None
         
-        # Get current discharge (first value is today)
         current_discharge = discharges[0] if discharges else 0
         current_level, current_emoji, current_text = get_alert_level(current_discharge)
         
-        # Print current status
         print(f"   💧 Forecast discharge: {current_discharge:.1f} m³/s - {current_emoji} {current_text}")
         
-        # Collect all forecast data
         forecast_data = []
         alerts = []
         
@@ -363,11 +512,9 @@ def analyze_forecast(data, location_name):
             }
             forecast_data.append(forecast_item)
             
-            # Check for alerts in next 7 days
             if level != "normal":
                 alerts.append(forecast_item)
         
-        # Print all forecast data
         print(f"   📊 7-day forecast:")
         for item in forecast_data:
             print(f"      {item['date']}: {item['discharge']:.1f} m³/s {item['emoji']}")
@@ -383,7 +530,6 @@ def analyze_forecast(data, location_name):
         }
         
         if alerts:
-            # Return the highest severity alert
             priority = {"critical": 3, "warning": 2, "watch": 1, "normal": 0}
             highest_alert = max(alerts, key=lambda x: priority[x["level"]])
             result["highest_alert"] = highest_alert
@@ -416,7 +562,7 @@ def send_telegram_message(message, disable_notification=False):
     
     Args:
         message: Message text to send
-        disable_notification: If True, sends message silently (no notification sound)
+        disable_notification: If True, sends message silently
         
     Returns:
         bool: True if successful, False otherwise
@@ -473,10 +619,10 @@ def create_alert_message(location, analysis, thaiwater_info=None, website_info=N
         ""
     ]
     
-    # Add website data if available (prioritize as it's most recent)
+    # Add website data if available
     if website_info:
         message_lines.extend([
-            "<b>🌐 ข้อมูลเรียลไทม์จากเว็บไซต์:</b>",
+            "<b>🌐 ข้อมูลเรียลไทม์:</b>",
             f"  💧 ระดับน้ำ: {website_info.get('water_level', 'N/A')} ม.(รทก.)",
             f"  🕐 อัปเดตล่าสุด: {website_info.get('datetime', 'N/A')}",
             f"  📡 แหล่งข้อมูล: {website_info.get('source', 'Chiang Mai ThaiWater')}",
@@ -502,7 +648,6 @@ def create_alert_message(location, analysis, thaiwater_info=None, website_info=N
         "<b>📊 พยากรณ์ 7 วันข้างหน้า:</b>"
     ])
     
-    # Add forecast for next 7 days
     for i, item in enumerate(analysis['forecast_data']):
         day_label = "วันนี้" if i == 0 else f"วันที่ {i+1}"
         date_str = format_thai_datetime(item['time'])
@@ -549,11 +694,11 @@ def create_summary_message(location, analysis, thaiwater_info=None, website_info
         f"📍 <b>พื้นที่:</b> {location['name']}",
     ]
     
-    # Add website data if available (prioritize as it's most recent)
+    # Add website data if available
     if website_info:
         message_lines.extend([
             "",
-            "<b>🌐 ข้อมูลเรียลไทม์จากเว็บไซต์:</b>",
+            "<b>🌐 ข้อมูลเรียลไทม์:</b>",
             f"  💧 ระดับน้ำ: {website_info.get('water_level', 'N/A')} ม.(รทก.)",
             f"  🕐 อัปเดตล่าสุด: {website_info.get('datetime', 'N/A')}",
         ])
@@ -582,7 +727,6 @@ def create_summary_message(location, analysis, thaiwater_info=None, website_info
         "<b>📈 พยากรณ์ 7 วันข้างหน้า:</b>"
     ])
     
-    # Add forecast for next 7 days
     for i, item in enumerate(analysis['forecast_data']):
         day_label = "วันนี้" if i == 0 else f"วันที่ {i+1}"
         date_str = format_thai_datetime(item['time'])
@@ -640,7 +784,7 @@ def create_error_message(location_name, error_type="api"):
 def main():
     """Main execution function"""
     print("=" * 60)
-    print("🌊 Flood Monitoring System - Ping River, Chiang Mai")
+    print("🌊 Flood Monitoring System - Ping River, Chiang Mai (IMPROVED)")
     print(f"⏰ Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
     
@@ -651,18 +795,22 @@ def main():
         print(f"\n📍 Checking: {location['name']}")
         print(f"   Coordinates: {location['latitude']}, {location['longitude']}")
         
-        # 1. Fetch data from Chiang Mai ThaiWater Website (most recent)
+        # 1. Fetch data from Chiang Mai ThaiWater Website (IMPROVED)
         website_info = None
         if location.get("web_station_id"):
-            print(f"\n🌐 Fetching data from Chiang Mai ThaiWater website...")
-            website_data = get_chiangmai_thaiwater_data(location["web_station_id"])
+            print(f"\n🌐 Fetching from Chiang Mai ThaiWater...")
+            website_data = get_chiangmai_thaiwater_data(
+                station_id=location["web_station_id"],
+                province_code=location.get("province_code")
+            )
             
             if website_data and len(website_data) > 0:
-                website_info = website_data[0]  # Get first matching station
-                print(f"   📊 Website: {website_info.get('water_level', 'N/A')} ม.(รทก.)")
+                website_info = website_data[0]
+                print(f"   ✅ Website: {website_info.get('water_level', 'N/A')} ม.(รทก.)")
                 print(f"   🕐 Time: {website_info.get('datetime', 'N/A')}")
+                print(f"   📡 Source: {website_info.get('source', 'N/A')}")
         
-        # 2. Fetch ThaiWater API data (as backup/comparison)
+        # 2. Fetch ThaiWater API data (as backup)
         thaiwater_info = None
         if location.get("station_code") and location.get("agency_code"):
             print(f"\n🔍 Fetching ThaiWater API data...")
@@ -674,11 +822,11 @@ def main():
             if thaiwater_data:
                 thaiwater_info = parse_thaiwater_data(thaiwater_data)
                 if thaiwater_info:
-                    print(f"   📊 ThaiWater API: {thaiwater_info.get('water_level', 'N/A')} ม.(รทก.)")
+                    print(f"   ✅ ThaiWater API: {thaiwater_info.get('water_level', 'N/A')} ม.(รทก.)")
                     if thaiwater_info.get('discharge'):
                         print(f"   💧 Discharge: {thaiwater_info['discharge']:.1f} m³/s")
         
-        # 3. Fetch forecast data from Open-Meteo
+        # 3. Fetch forecast from Open-Meteo
         print(f"\n🔍 Fetching Open-Meteo forecast...")
         data = get_flood_forecast(location["latitude"], location["longitude"])
         
@@ -706,18 +854,15 @@ def main():
             print(f"   💧 Peak discharge: {analysis['highest_alert']['discharge']:.1f} m³/s")
             print(f"   📅 Date: {analysis['highest_alert']['date']}")
             
-            # Send alert message with all available data
             message = create_alert_message(location, analysis, thaiwater_info, website_info)
             send_telegram_message(message, disable_notification=False)
             any_alerts = True
         else:
             print(f"   ✅ No alerts - levels within normal range")
             
-            # Send summary report if configured
             if ALWAYS_SEND_REPORT:
                 print(f"   📤 Sending summary report...")
                 message = create_summary_message(location, analysis, thaiwater_info, website_info)
-                # Use silent notification for normal reports
                 send_telegram_message(message, disable_notification=True)
     
     print("\n" + "=" * 60)
