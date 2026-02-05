@@ -43,4 +43,5 @@ jobs:
           path: |
             *.log
             *.txt
+            *.html
           retention-days: 7
